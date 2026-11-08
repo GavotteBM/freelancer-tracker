@@ -110,16 +110,25 @@ def extract_budget(summary: str) -> str:
 # --------------------------------------------------------------------------- #
 SYSTEM_PROMPT = (
     "You are an expert freelance web scraping and data extraction specialist "
-    "writing winning bids on Freelancer.com. Write in English, professional and "
-    "confident, maximum 120 words. Address the client's specific need from the "
-    "job post. Always highlight fast delivery of clean data in Excel/CSV format "
-    "and offer a FREE 10-row sample batch so the client can verify quality before "
-    "hiring. End with a short call to action. Output ONLY the proposal text: no "
-    "subject line, no placeholders like [Name], no markdown, no backticks."
+    "writing winning bids on Freelancer.com, and you also brief a Spanish-speaking "
+    "freelancer about each job. Return a JSON object with exactly these keys:\n"
+    '- "summary_en": 2-3 sentence plain summary in English of what the client wants.\n'
+    '- "title_es": the job title translated to Spanish.\n'
+    '- "summary_es": the same summary translated to Spanish.\n'
+    '- "proposal_en": the bid in English, professional and confident, maximum 120 '
+    "words. Address the client's specific need. Always highlight fast delivery of "
+    "clean data in Excel/CSV format and offer a FREE 10-row sample batch so the "
+    "client can verify quality before hiring. End with a short call to action. No "
+    "subject line, no placeholders like [Name], no markdown.\n"
+    '- "proposal_es": a faithful Spanish translation of proposal_en.\n'
+    "Never use backticks in any value."
 )
 
+REQUIRED_KEYS = ("summary_en", "title_es", "summary_es", "proposal_en", "proposal_es")
 
-def generate_proposal(client: genai.Client, job: dict) -> str:
+
+def generate_proposal(client: genai.Client, job: dict) -> dict:
+    """Return dict with summary_en, title_es, summary_es, proposal_en, proposal_es."""
     user_prompt = (
         f"Job title: {job['title']}\n"
         f"Budget: {job['budget']}\n"
@@ -131,13 +140,16 @@ def generate_proposal(client: genai.Client, job: dict) -> str:
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             temperature=0.7,
-            max_output_tokens=1024,
+            max_output_tokens=2048,
+            response_mime_type="application/json",
         ),
     )
-    text = (response.text or "").strip()
-    if not text:
-        raise RuntimeError("Gemini returned an empty response")
-    return text.replace("`", "'")  # Backticks would break the Telegram code block.
+    data = json.loads(response.text or "{}")
+    missing = [k for k in REQUIRED_KEYS if not str(data.get(k, "")).strip()]
+    if missing:
+        raise RuntimeError(f"Gemini response missing keys: {missing}")
+    # Backticks would break the Telegram code blocks.
+    return {k: str(data[k]).strip().replace("`", "'") for k in REQUIRED_KEYS}
 
 
 # --------------------------------------------------------------------------- #
@@ -148,14 +160,20 @@ def escape_md(text: str) -> str:
     return re.sub(r"([_*`\[])", r"\\\1", text)
 
 
-def build_message(job: dict, proposal: str) -> str:
+def build_message(job: dict, ai: dict) -> str:
     return (
-        "🚨 *New Freelancer job*\n\n"
-        f"📌 *{escape_md(job['title'])}*\n"
-        f"💰 *Budget:* {escape_md(job['budget'])}\n"
-        f"🔗 [Open job]({job['link']})\n\n"
-        "✍️ *Proposal (tap to copy):*\n"
-        f"```\n{proposal}\n```"
+        "🚨 *Nueva oferta / New job*\n\n"
+        f"🇬🇧 *{escape_md(job['title'])}*\n"
+        f"🇪🇸 *{escape_md(ai['title_es'])}*\n"
+        f"💰 *Presupuesto / Budget:* {escape_md(job['budget'])}\n"
+        f"🔗 [Abrir oferta / Open job]({job['link']})\n\n"
+        "📋 *De qué trata / What it's about:*\n"
+        f"🇬🇧 {escape_md(ai['summary_en'])}\n\n"
+        f"🇪🇸 {escape_md(ai['summary_es'])}\n\n"
+        "✍️ *Propuesta a enviar (EN) — toca para copiar:*\n"
+        f"```\n{ai['proposal_en']}\n```\n"
+        "🇪🇸 *Traducción (solo referencia, no enviar):*\n"
+        f"_{escape_md(ai['proposal_es']).replace(chr(10), ' ')}_"
     )
 
 
@@ -220,12 +238,12 @@ def main() -> int:
 
     for job in new_jobs:
         try:
-            proposal = generate_proposal(client, job)
+            ai = generate_proposal(client, job)
         except Exception as exc:  # noqa: BLE001
             log.error("Gemini failed for '%s': %s", job["title"], exc)
             continue  # Not marked as seen -> retried next run.
 
-        if send_telegram(build_message(job, proposal)):
+        if send_telegram(build_message(job, ai)):
             log.info("Alert sent: %s", job["title"])
             seen.append(job["id"])
             seen_set.add(job["id"])
