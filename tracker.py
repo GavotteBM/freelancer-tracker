@@ -15,7 +15,9 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
@@ -51,6 +53,8 @@ RSS_URLS = [
     "https://www.freelancer.com/rss/job_web-search.xml",
 ]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# Time zone used to show the job's publication date in Telegram alerts.
+LOCAL_TZ = ZoneInfo(os.getenv("TIMEZONE", "America/Caracas"))
 SEEN_FILE = Path(__file__).with_name("seen_jobs.json")
 # Must stay well above the number of unique jobs across all feeds (~250),
 # otherwise old IDs fall out of the history and get re-alerted.
@@ -308,11 +312,27 @@ def escape_md(text: str) -> str:
     return re.sub(r"([_*`\[])", r"\\\1", text)
 
 
+def format_published(epoch: float | None) -> str:
+    """e.g. '08/11/2026 11:45 (hace 2 h)' in LOCAL_TZ."""
+    if epoch is None:
+        return "Desconocida / Unknown"
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone(LOCAL_TZ)
+    minutes = max(0, int((time.time() - epoch) // 60))
+    if minutes < 60:
+        ago = f"hace {minutes} min"
+    elif minutes < 48 * 60:
+        ago = f"hace {minutes // 60} h {minutes % 60} min"
+    else:
+        ago = f"hace {minutes // 1440} días"
+    return f"{dt:%d/%m/%Y %H:%M} ({ago})"
+
+
 def build_message(job: dict, ai: dict) -> str:
     return (
         "🚨 *Nueva oferta / New job*\n\n"
         f"🇬🇧 *{escape_md(job['title'])}*\n"
         f"🇪🇸 *{escape_md(ai['title_es'])}*\n"
+        f"🕒 *Publicada / Posted:* {format_published(job['published'])}\n"
         f"💰 *Presupuesto / Budget:* {escape_md(job['budget'])}\n"
         f"🔗 [Abrir oferta / Open job]({job['link']})\n\n"
         "📋 *De qué trata / What it's about:*\n"
