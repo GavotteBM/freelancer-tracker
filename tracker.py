@@ -227,22 +227,31 @@ def generate_proposal(client: genai.Client, job: dict) -> dict:
         f"Budget: {job['budget']}\n"
         f"Description: {job['summary'][:2000]}"
     )
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=user_prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.7,
-            max_output_tokens=2048,
-            response_mime_type="application/json",
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        temperature=0.7,
+        max_output_tokens=2048,
+        response_mime_type="application/json",
     )
-    data = json.loads(response.text or "{}")
-    missing = [k for k in REQUIRED_KEYS if not str(data.get(k, "")).strip()]
-    if missing:
-        raise RuntimeError(f"Gemini response missing keys: {missing}")
-    # Backticks would break the Telegram code blocks.
-    return {k: str(data[k]).strip().replace("`", "'") for k in REQUIRED_KEYS}
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL, contents=user_prompt, config=config
+            )
+            data = json.loads(response.text or "{}")
+            missing = [k for k in REQUIRED_KEYS if not str(data.get(k, "")).strip()]
+            if missing:
+                raise RuntimeError(f"Gemini response missing keys: {missing}")
+            # Backticks would break the Telegram code blocks.
+            return {k: str(data[k]).strip().replace("`", "'") for k in REQUIRED_KEYS}
+        except Exception as exc:  # noqa: BLE001 - 503 overload, bad JSON, etc.
+            if attempt == attempts:
+                raise
+            wait = 5 * attempt
+            log.warning("Gemini attempt %d failed (%s); retrying in %ds", attempt, exc, wait)
+            time.sleep(wait)
+    raise RuntimeError("unreachable")
 
 
 # --------------------------------------------------------------------------- #
