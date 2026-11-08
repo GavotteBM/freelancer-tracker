@@ -7,6 +7,7 @@ send Telegram alert -> persist seen IDs. Designed to be invoked by cron
 
 from __future__ import annotations
 
+import calendar
 import html
 import json
 import logging
@@ -31,11 +32,23 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-RSS_URL = "https://www.freelancer.com/rss.xml?keyword=web%20scraping%20data%20extraction"
+# Several feeds are merged (deduplicated by job ID). The original keyword feed
+# alone only returned ~2 jobs; the category feeds return ~30 each.
+RSS_URLS = [
+    "https://www.freelancer.com/rss/job_web-scraping.xml",
+    "https://www.freelancer.com/rss/job_data-extraction.xml",
+    "https://www.freelancer.com/rss.xml?keyword=scraping",
+    "https://www.freelancer.com/rss.xml?keyword=web%20scraping%20data%20extraction",
+]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 SEEN_FILE = Path(__file__).with_name("seen_jobs.json")
-MAX_SEEN_IDS = 50
-MAX_JOBS_PER_RUN = 10  # Avoid flooding Telegram / Gemini rate limits on the first run.
+# Must stay well above the number of unique jobs across all feeds (~60-80),
+# otherwise old IDs fall out of the history and get re-alerted.
+MAX_SEEN_IDS = 500
+# Max alerts per run. If more relevant new jobs appear at once (e.g. the first
+# run), only the newest ones are sent and the rest are marked seen silently.
+MAX_JOBS_PER_RUN = 10
+MAX_JOB_AGE_HOURS = 48  # Category feeds include very old jobs (even years old).
 HTTP_TIMEOUT = 20
 
 # --- Relevance filter -------------------------------------------------------
@@ -101,8 +114,8 @@ def save_seen(seen: list[str]) -> None:
 # --------------------------------------------------------------------------- #
 # Feed
 # --------------------------------------------------------------------------- #
-def fetch_feed() -> list[dict]:
-    resp = requests.get(RSS_URL, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+def fetch_one_feed(url: str) -> list[dict]:
+    resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     feed = feedparser.parse(resp.content)
     if feed.bozo and not feed.entries:
@@ -116,6 +129,7 @@ def fetch_feed() -> list[dict]:
             continue
         summary_raw = entry.get("summary", "") or entry.get("description", "")
         summary = clean_html(summary_raw)
+        published = entry.get("published_parsed")
         jobs.append(
             {
                 "id": str(job_id),
@@ -123,9 +137,36 @@ def fetch_feed() -> list[dict]:
                 "link": link,
                 "summary": summary,
                 "budget": extract_budget(summary),
+                # UTC epoch seconds; None if the feed gave no date.
+                "published": calendar.timegm(published) if published else None,
             }
         )
     return jobs
+
+
+def fetch_feed() -> list[dict]:
+    """Fetch all feeds, dedupe by ID and return jobs sorted oldest -> newest.
+
+    A failing feed is logged and skipped; raises only if every feed fails.
+    """
+    jobs: dict[str, dict] = {}
+    failures = 0
+    for url in RSS_URLS:
+        try:
+            for job in fetch_one_feed(url):
+                jobs.setdefault(job["id"], job)
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            log.warning("Feed failed (%s): %s", url, exc)
+    if failures == len(RSS_URLS):
+        raise RuntimeError("All RSS feeds failed")
+    return sorted(jobs.values(), key=lambda j: j["published"] or 0)
+
+
+def is_recent(job: dict) -> bool:
+    if job["published"] is None:
+        return True  # No date -> don't drop it.
+    return time.time() - job["published"] <= MAX_JOB_AGE_HOURS * 3600
 
 
 def _matches_any(text: str, keywords: list[str]) -> str | None:
@@ -274,28 +315,41 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 - network errors shouldn't crash cron noisily
         log.error("Failed to fetch RSS feed: %s", exc)
         return 1
-    log.info("Feed returned %d jobs", len(jobs))
+    log.info("Feeds returned %d unique jobs", len(jobs))
 
     seen = load_seen()
     seen_set = set(seen)
-    # RSS lists newest first; process oldest-first so alerts arrive in order.
-    unseen = [j for j in reversed(jobs) if j["id"] not in seen_set]
-    # Filtered-out jobs are NOT added to seen_jobs.json: filtering costs no API
-    # calls, and this keeps the 50-ID history for jobs actually alerted.
+    changed = False
+    # jobs is sorted oldest -> newest, so alerts arrive in chronological order.
+    # Old or irrelevant jobs are NOT added to seen_jobs.json: filtering costs no
+    # API calls, and this keeps the history for jobs that actually matter.
     new_jobs = []
-    for job in unseen:
+    too_old = irrelevant = 0
+    for job in jobs:
+        if job["id"] in seen_set:
+            continue
+        if not is_recent(job):
+            too_old += 1
+            continue
         relevant, reason = is_relevant(job)
-        if relevant:
-            new_jobs.append(job)
-        else:
+        if not relevant:
+            irrelevant += 1
             log.info("Skipped (%s): %s", reason, job["title"])
+            continue
+        new_jobs.append(job)
+    log.info("Ignored %d jobs older than %dh, %d irrelevant", too_old, MAX_JOB_AGE_HOURS, irrelevant)
+
     if len(new_jobs) > MAX_JOBS_PER_RUN:
-        log.info("Capping %d new jobs to the %d most recent", len(new_jobs), MAX_JOBS_PER_RUN)
+        backlog = new_jobs[:-MAX_JOBS_PER_RUN]
         new_jobs = new_jobs[-MAX_JOBS_PER_RUN:]
+        log.info("Backlog: marking %d older jobs as seen without alerting", len(backlog))
+        for job in backlog:
+            seen.append(job["id"])
+            seen_set.add(job["id"])
+        changed = True
     log.info("%d new jobs to process", len(new_jobs))
 
     client = genai.Client(api_key=GEMINI_API_KEY)
-    changed = False
 
     for job in new_jobs:
         try:
