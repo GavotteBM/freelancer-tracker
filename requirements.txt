@@ -1,4 +1,4 @@
-groq
+google-genai
 requests
 feedparser
 python-dotenv
