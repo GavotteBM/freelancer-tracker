@@ -37,6 +37,40 @@ SEEN_FILE = Path(__file__).with_name("seen_jobs.json")
 MAX_SEEN_IDS = 50
 MAX_JOBS_PER_RUN = 10  # Avoid flooding Telegram / Gemini rate limits on the first run.
 HTTP_TIMEOUT = 20
+
+# --- Relevance filter -------------------------------------------------------
+# A job is alerted only if its title/description/skill tags contain at least one
+# INCLUDE keyword and its title contains none of the EXCLUDE keywords.
+# Matching is case-insensitive and on word starts ("scrap" matches "scraping").
+INCLUDE_KEYWORDS = [
+    "scrap",            # scrape, scraper, scraping
+    "crawl",            # crawler, crawling
+    "data extraction",
+    "extract data",
+    "data mining",
+    "data collection",
+    "web data",
+    "lead generation",
+    "lead list",
+    "data entry",
+    "excel",
+    "csv",
+    "spreadsheet",
+    "selenium",
+    "beautifulsoup",
+    "playwright",
+    "puppeteer",
+]
+EXCLUDE_TITLE_KEYWORDS = [
+    "presenter",
+    "actor",
+    "actress",
+    "voice over",
+    "voiceover",
+    "logo",
+    "tiktok creator",
+    "ugc",
+]
 USER_AGENT = "Mozilla/5.0 (compatible; FreelancerJobTracker/1.0)"
 
 logging.basicConfig(
@@ -92,6 +126,24 @@ def fetch_feed() -> list[dict]:
             }
         )
     return jobs
+
+
+def _matches_any(text: str, keywords: list[str]) -> str | None:
+    for kw in keywords:
+        if re.search(r"\b" + re.escape(kw), text, re.IGNORECASE):
+            return kw
+    return None
+
+
+def is_relevant(job: dict) -> tuple[bool, str]:
+    """Return (relevant, reason) according to the keyword filter."""
+    bad = _matches_any(job["title"], EXCLUDE_TITLE_KEYWORDS)
+    if bad:
+        return False, f"excluded keyword '{bad}' in title"
+    good = _matches_any(f"{job['title']} {job['summary']}", INCLUDE_KEYWORDS)
+    if not good:
+        return False, "no relevant keyword"
+    return True, f"matched '{good}'"
 
 
 def clean_html(text: str) -> str:
@@ -227,7 +279,16 @@ def main() -> int:
     seen = load_seen()
     seen_set = set(seen)
     # RSS lists newest first; process oldest-first so alerts arrive in order.
-    new_jobs = [j for j in reversed(jobs) if j["id"] not in seen_set]
+    unseen = [j for j in reversed(jobs) if j["id"] not in seen_set]
+    # Filtered-out jobs are NOT added to seen_jobs.json: filtering costs no API
+    # calls, and this keeps the 50-ID history for jobs actually alerted.
+    new_jobs = []
+    for job in unseen:
+        relevant, reason = is_relevant(job)
+        if relevant:
+            new_jobs.append(job)
+        else:
+            log.info("Skipped (%s): %s", reason, job["title"])
     if len(new_jobs) > MAX_JOBS_PER_RUN:
         log.info("Capping %d new jobs to the %d most recent", len(new_jobs), MAX_JOBS_PER_RUN)
         new_jobs = new_jobs[-MAX_JOBS_PER_RUN:]
