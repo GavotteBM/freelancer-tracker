@@ -35,16 +35,26 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # Several feeds are merged (deduplicated by job ID). The original keyword feed
 # alone only returned ~2 jobs; the category feeds return ~30 each.
 RSS_URLS = [
+    # Web scraping / data extraction
     "https://www.freelancer.com/rss/job_web-scraping.xml",
     "https://www.freelancer.com/rss/job_data-extraction.xml",
     "https://www.freelancer.com/rss.xml?keyword=scraping",
     "https://www.freelancer.com/rss.xml?keyword=web%20scraping%20data%20extraction",
+    # Data entry & related
+    "https://www.freelancer.com/rss/job_data-entry.xml",
+    "https://www.freelancer.com/rss/job_excel.xml",
+    "https://www.freelancer.com/rss/job_data-processing.xml",
+    "https://www.freelancer.com/rss/job_google-sheets.xml",
+    "https://www.freelancer.com/rss/job_typing.xml",
+    "https://www.freelancer.com/rss/job_data-cleansing.xml",
+    "https://www.freelancer.com/rss/job_pdf.xml",
+    "https://www.freelancer.com/rss/job_web-search.xml",
 ]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 SEEN_FILE = Path(__file__).with_name("seen_jobs.json")
-# Must stay well above the number of unique jobs across all feeds (~60-80),
+# Must stay well above the number of unique jobs across all feeds (~250),
 # otherwise old IDs fall out of the history and get re-alerted.
-MAX_SEEN_IDS = 500
+MAX_SEEN_IDS = 1000
 # Max alerts per run. If more relevant new jobs appear at once (e.g. the first
 # run), only the newest ones are sent and the rest are marked seen silently.
 MAX_JOBS_PER_RUN = 10
@@ -66,9 +76,32 @@ INCLUDE_KEYWORDS = [
     "lead generation",
     "lead list",
     "data entry",
+    "data input",
+    "input data",
+    "data processing",
+    "data cleaning",
+    "data cleansing",
+    "data cleanup",
+    "data conversion",
+    "copy paste",
+    "copy-paste",
+    "copy typing",
+    "typing",
+    "pdf to excel",
+    "product listing",
+    "web search",
+    "web research",
+    "google sheets",
     "excel",
     "csv",
     "spreadsheet",
+    "pdf",              # PDF to Word/Excel, PDF cleanup, retyping...
+    "transcri",         # transcribe, transcription
+    "retyp",            # retype, retyping
+    "captura de datos",
+    "entrada de datos",
+    "pengetikan",       # Indonesian: typing (very common on Freelancer)
+    "ketik",            # Indonesian: to type
     "selenium",
     "beautifulsoup",
     "playwright",
@@ -83,6 +116,11 @@ EXCLUDE_TITLE_KEYWORDS = [
     "logo",
     "tiktok creator",
     "ugc",
+    "sales representative",
+    "sales agent",
+    "telemarketing",
+    "customer service",
+    "lead conversion",
 ]
 USER_AGENT = "Mozilla/5.0 (compatible; FreelancerJobTracker/1.0)"
 
@@ -181,7 +219,11 @@ def is_relevant(job: dict) -> tuple[bool, str]:
     bad = _matches_any(job["title"], EXCLUDE_TITLE_KEYWORDS)
     if bad:
         return False, f"excluded keyword '{bad}' in title"
-    good = _matches_any(f"{job['title']} {job['summary']}", INCLUDE_KEYWORDS)
+    # Ignore Freelancer's trailing "(Budget: ..., Jobs: tag1, tag2)" block: the
+    # skill tags (e.g. "Data Entry", "Excel") are added to many unrelated jobs
+    # such as telemarketing or customer service.
+    description = re.sub(r"\(Budget:.*$", "", job["summary"])
+    good = _matches_any(f"{job['title']} {description}", INCLUDE_KEYWORDS)
     if not good:
         return False, "no relevant keyword"
     return True, f"matched '{good}'"
@@ -202,8 +244,12 @@ def extract_budget(summary: str) -> str:
 # Gemini proposal
 # --------------------------------------------------------------------------- #
 SYSTEM_PROMPT = (
-    "You are an expert freelance web scraping and data extraction specialist "
-    "writing winning bids on Freelancer.com, and you also brief a Spanish-speaking "
+    "You are an expert freelance specialist in web scraping, data extraction and "
+    "data entry (Excel, Google Sheets, PDF-to-Excel, data cleaning, product "
+    "listings, web research), writing winning bids on Freelancer.com. Adapt the "
+    "pitch to the job: for scraping jobs stress automation and reliability; for "
+    "data entry jobs stress accuracy, attention to detail and fast turnaround. "
+    "You also brief a Spanish-speaking "
     "freelancer about each job. Return a JSON object with exactly these keys:\n"
     '- "summary_en": 2-3 sentence plain summary in English of what the client wants.\n'
     '- "title_es": the job title translated to Spanish.\n'
